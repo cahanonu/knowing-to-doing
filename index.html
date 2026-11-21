@@ -1,0 +1,696 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#FFFFFF" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#191C2C" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Knowing to Doing">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" href="icon-192.png" type="image/png">
+<style>html{color-scheme:light dark}body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
+<script>/* Offline storage layer: gives the dashboard the same db / user / assets calls it uses online,
+   but keeps everything in this phone's IndexedDB. No network, no account. */
+(function(){
+"use strict";
+window.OFFLINE=true;
+const DBN="knowing-to-doing", VER=1;
+let idb=null;
+function openIdb(){return new Promise((res,rej)=>{const r=indexedDB.open(DBN,VER);r.onupgradeneeded=()=>{const d=r.result;if(!d.objectStoreNames.contains("kv"))d.createObjectStore("kv");if(!d.objectStoreNames.contains("blobs"))d.createObjectStore("blobs");};r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});}
+function tx(store,mode,fn){return new Promise((res,rej)=>{const t=idb.transaction(store,mode);const s=t.objectStore(store);let out;const q=fn(s);if(q)q.onsuccess=()=>{out=q.result;};t.oncomplete=()=>res(out);t.onerror=()=>rej(t.error);});}
+const kvGet=k=>tx("kv","readonly",s=>s.get(k));
+const kvSet=(k,v)=>tx("kv","readwrite",s=>s.put(v,k));
+
+let state={collections:{}};
+const ready=(async()=>{try{idb=await openIdb();const s=await kvGet("state");if(s&&s.collections)state=s;}catch(e){console.warn("Storage unavailable",e);}})();
+let saveT=null;
+function persist(){clearTimeout(saveT);saveT=setTimeout(()=>{if(idb)kvSet("state",state).catch(e=>console.warn(e));},120);}
+const docL={}, colL={};
+function col(c){return state.collections[c]||(state.collections[c]={});}
+function clone(o){return o==null?o:JSON.parse(JSON.stringify(o));}
+function snapDoc(c,id){const d=(state.collections[c]||{})[id];return{id,exists:!!d,data:()=>d?clone(d):undefined,metadata:{fromCache:false,hasPendingWrites:false}};}
+function snapCol(c){const docs=Object.keys(state.collections[c]||{}).sort().map(id=>snapDoc(c,id));return{docs,size:docs.length,empty:!docs.length,docChanges:()=>[],metadata:{fromCache:false,hasPendingWrites:false}};}
+function emit(c,id){(colL[c]||[]).forEach(f=>{try{f(snapCol(c));}catch(e){console.error(e);}});(docL[c+"/"+id]||[]).forEach(f=>{try{f(snapDoc(c,id));}catch(e){console.error(e);}});}
+function emitAll(){Object.keys(colL).forEach(c=>(colL[c]||[]).forEach(f=>f(snapCol(c))));Object.keys(docL).forEach(p=>{const i=p.indexOf("/");(docL[p]||[]).forEach(f=>f(snapDoc(p.slice(0,i),p.slice(i+1))));});}
+function newId(){return Date.now().toString(36)+Math.random().toString(36).slice(2,8);}
+function docRef(c,id){return{
+  id,path:c+"/"+id,
+  async get(){await ready;return snapDoc(c,id);},
+  async set(data){await ready;col(c)[id]=clone(data);persist();emit(c,id);},
+  async update(data){await ready;const cur=col(c)[id];if(!cur)throw{code:"invalid_argument",message:"Document does not exist"};Object.assign(cur,clone(data));persist();emit(c,id);},
+  async delete(){await ready;delete col(c)[id];persist();emit(c,id);},
+  onSnapshot(next){const k=c+"/"+id;(docL[k]=docL[k]||[]).push(next);ready.then(()=>next(snapDoc(c,id)));return()=>{docL[k]=(docL[k]||[]).filter(f=>f!==next);};}
+};}
+const db={
+  doc(p){const i=p.indexOf("/");return docRef(p.slice(0,i),p.slice(i+1));},
+  collection(c){return{path:c,doc(id){return docRef(c,id||newId());},async add(data){const r=docRef(c,newId());await r.set(data);return r;},async get(){await ready;return snapCol(c);},onSnapshot(next){(colL[c]=colL[c]||[]).push(next);ready.then(()=>next(snapCol(c)));return()=>{colL[c]=(colL[c]||[]).filter(f=>f!==next);};}};}
+};
+const user={isOwner:async()=>true,canEdit:async()=>true,can:async()=>true,id:async()=>"me",me:async()=>({id:"me",name:"",email:null})};
+const urls={};
+const assets={
+  async upload(blob,opts){await ready;if(!idb)throw{code:"store_unavailable",message:"Storage unavailable"};if(blob.size>20*1024*1024)throw{code:"file_too_large",message:"Over 20 MB"};const id=newId();await tx("blobs","readwrite",s=>s.put(blob,id));urls[id]=URL.createObjectURL(blob);return{id,url:urls[id],sizeBytes:blob.size,contentType:(opts&&opts.type)||blob.type||"application/octet-stream"};},
+  async delete(id){await ready;if(idb)await tx("blobs","readwrite",s=>s.delete(id));return{deleted:true};},
+  async list(){return{assets:[],usage:{files:0,bytes:0,maxFiles:0,maxBytes:0}};}
+};
+async function blobUrl(id){if(urls[id])return urls[id];await ready;const b=idb?await tx("blobs","readonly",s=>s.get(id)):null;if(!b)return null;urls[id]=URL.createObjectURL(b);return urls[id];}
+/* uploaded files are linked as /_blob/<id> by the dashboard: open them from local storage instead */
+document.addEventListener("click",async e=>{const a=e.target.closest&&e.target.closest('a[href^="/_blob/"]');if(!a)return;e.preventDefault();const u=await blobUrl(a.getAttribute("href").slice(7));if(u)window.open(u,"_blank");else alert("This file is not stored on this phone.");},true);
+
+window.claude={use:async n=>{await ready;return n==="db"?db:n==="user"?user:n==="assets"?assets:null;}};
+
+/* backup and import */
+window.offlineData={
+  exportObject(){return{app:"knowing-to-doing",version:1,exportedAt:new Date().toISOString(),collections:clone(state.collections)};},
+  async importObject(obj,mode){await ready;if(!obj||typeof obj!=="object"||!obj.collections||typeof obj.collections!=="object")throw new Error("This file is not a dashboard backup.");
+    let n=0;if(mode==="replace")state.collections={};
+    for(const c of Object.keys(obj.collections)){if(!/^[a-z]+$/.test(c))continue;const src=obj.collections[c];if(!src||typeof src!=="object")continue;for(const id of Object.keys(src)){if(src[id]&&typeof src[id]==="object"){col(c)[id]=clone(src[id]);n++;}}}
+    if(idb)await kvSet("state",state);emitAll();return n;},
+  async counts(){await ready;const o={};Object.keys(state.collections).forEach(c=>o[c]=Object.keys(state.collections[c]).length);return o;},
+  async lastBackup(){await ready;return idb?kvGet("lastBackup"):null;},
+  async markBackup(){if(idb)await kvSet("lastBackup",new Date().toISOString());},
+  async persist(){try{if(navigator.storage&&navigator.storage.persist)return await navigator.storage.persist();}catch(_){}return false;}
+};
+if("serviceWorker" in navigator&&location.protocol!=="file:"){window.addEventListener("load",()=>{navigator.serviceWorker.register("sw.js").catch(e=>console.warn("Offline cache not registered",e));});}
+})();
+</script>
+</head><body>
+<title>Knowing to Doing</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Figtree:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap">
+<style>
+/* Layout: app shell. Sticky header, one view at a time, bottom tab bar on phones, side rail on wide screens. Quick-capture button always in reach. */
+:root{
+  --bg:#F4F5FA; --surface:#FFFFFF; --sunk:#ECEEF6; --ink:#1B1E3B; --muted:#5E6383; --line:#DFE2EE;
+  --accent:#3B3FB6; --accent-ink:#FFFFFF; --lit:#E89B0C; --lit-soft:#FDF1D8;
+  --good:#1F8A5B; --good-soft:#E1F3EA; --warn:#A8690F; --warn-soft:#FBEFD9; --bad:#B83A34; --bad-soft:#F8E3E1; --info-soft:#E7E8FA;
+  --display:"Bricolage Grotesque", "Avenir Next", system-ui, sans-serif;
+  --body:"Figtree", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono:"JetBrains Mono", ui-monospace, Menlo, monospace;
+  --r:12px;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#10121D; --surface:#191C2C; --sunk:#141726; --ink:#E8E9F5; --muted:#9CA0BF; --line:#2A2E45;
+  --accent:#9094F7; --accent-ink:#10121D; --lit:#F5B93A; --lit-soft:#3A2E14;
+  --good:#4CC38A; --good-soft:#16332A; --warn:#E3AA4E; --warn-soft:#382A14; --bad:#EF6B64; --bad-soft:#3A1C1C; --info-soft:#24264A;
+  color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#10121D; --surface:#191C2C; --sunk:#141726; --ink:#E8E9F5; --muted:#9CA0BF; --line:#2A2E45;
+  --accent:#9094F7; --accent-ink:#10121D; --lit:#F5B93A; --lit-soft:#3A2E14;
+  --good:#4CC38A; --good-soft:#16332A; --warn:#E3AA4E; --warn-soft:#382A14; --bad:#EF6B64; --bad-soft:#3A1C1C; --info-soft:#24264A;
+  color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--body);font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);z-index:30;background:var(--surface)}
+h1,h2,h3{font-family:var(--display);line-height:1.15;text-wrap:balance;margin:0}
+h2{font-size:1.35rem;font-weight:700}
+h3{font-size:1.02rem;font-weight:700}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+a{color:var(--accent)}
+.mono{font-family:var(--mono);font-size:.82em}
+.muted{color:var(--muted)}
+.small{font-size:.86rem}
+.eyebrow{font-size:.72rem;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:600}
+
+/* header */
+.top{position:sticky;top:env(safe-area-inset-top,0px);z-index:20;background:var(--surface);border-bottom:1px solid var(--line)}
+.top-in{display:flex;align-items:center;gap:12px;padding-block:10px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));max-width:1180px;margin:0 auto}
+.mark{width:34px;height:34px;border-radius:9px;background:var(--accent);display:grid;place-items:center;flex:none}
+.mark svg{display:block}
+.brand{min-width:0}
+.brand b{font-family:var(--display);font-size:1.05rem;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brand span{font-size:.78rem;color:var(--muted);display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sync{margin-left:auto;font-size:.75rem;color:var(--muted);display:flex;align-items:center;gap:6px;flex:none}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.dot.ok{background:var(--good)}
+
+/* shell */
+.shell{max-width:1180px;margin:0 auto;display:flex;gap:24px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:18px 120px}
+.rail{display:none}
+main{flex:1;min-width:0}
+.tabs{position:fixed;left:0;right:0;bottom:0;z-index:25;background:var(--surface);border-top:1px solid var(--line);display:grid;grid-template-columns:repeat(6,1fr);padding-bottom:env(safe-area-inset-bottom,0px);padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px)}
+.tab{background:none;border:0;padding:8px 2px 7px;display:flex;flex-direction:column;align-items:center;gap:2px;font-size:.68rem;color:var(--muted);font-weight:600}
+.tab svg{width:22px;height:22px}
+.tab[aria-current="page"]{color:var(--accent)}
+@media (min-width:900px){
+  .tabs{display:none}
+  .rail{display:flex;flex-direction:column;gap:4px;width:190px;flex:none;position:sticky;top:calc(env(safe-area-inset-top,0px) + 76px);align-self:flex-start}
+  .rail .tab{flex-direction:row;justify-content:flex-start;gap:10px;font-size:.92rem;padding:9px 12px;border-radius:10px}
+  .rail .tab[aria-current="page"]{background:var(--info-soft)}
+  .shell{padding-block:24px 60px}
+}
+.fab{position:fixed;z-index:26;right:calc(16px + env(safe-area-inset-right,0px));bottom:calc(76px + env(safe-area-inset-bottom,0px));background:var(--lit);color:#1B1E3B;border:0;border-radius:999px;padding:13px 18px 13px 14px;font-weight:700;display:flex;align-items:center;gap:8px;box-shadow:0 6px 20px rgba(20,20,60,.25)}
+.fab svg{width:20px;height:20px}
+@media (min-width:900px){.fab{bottom:calc(28px + env(safe-area-inset-bottom,0px))}}
+
+/* building blocks */
+.stack{display:flex;flex-direction:column;gap:16px}
+.grid2{display:grid;grid-template-columns:1fr;gap:16px}
+@media (min-width:720px){.grid2{grid-template-columns:1fr 1fr}}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px;min-width:0}
+.panel-h{display:flex;align-items:center;gap:10px;justify-content:space-between;margin-bottom:10px}
+.btn{border:1px solid var(--line);background:var(--surface);border-radius:9px;padding:7px 12px;font-weight:600;font-size:.86rem;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.btn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.btn.ghost{border-color:transparent;background:transparent;color:var(--accent);padding-inline:6px}
+.btn.danger{color:var(--bad);border-color:var(--bad)}
+.btn:disabled{opacity:.5;cursor:default}
+.pill{display:inline-flex;align-items:center;gap:4px;border-radius:999px;padding:2px 9px;font-size:.74rem;font-weight:700;white-space:nowrap;background:var(--sunk);color:var(--muted);border:0}
+.pill.good{background:var(--good-soft);color:var(--good)}
+.pill.warn{background:var(--warn-soft);color:var(--warn)}
+.pill.bad{background:var(--bad-soft);color:var(--bad)}
+.pill.info{background:var(--info-soft);color:var(--accent)}
+.pill.lit{background:var(--lit-soft);color:var(--warn)}
+.row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.list{display:flex;flex-direction:column}
+.item{display:flex;gap:12px;align-items:flex-start;padding:11px 0;border-top:1px solid var(--line);min-width:0}
+.item:first-child{border-top:0}
+.item-main{flex:1;min-width:0}
+.tap{background:none;border:0;text-align:left;padding:0;width:100%;display:block}
+.empty{border:1.5px dashed var(--line);border-radius:var(--r);padding:18px;color:var(--muted);text-align:center;font-size:.92rem}
+.banner{background:var(--warn-soft);color:var(--warn);border-radius:10px;padding:10px 14px;font-size:.88rem;font-weight:600;margin-bottom:14px}
+.seg{display:inline-flex;background:var(--sunk);border-radius:10px;padding:3px;gap:2px;flex-wrap:wrap}
+.seg button{border:0;background:none;padding:6px 12px;border-radius:8px;font-weight:600;font-size:.86rem;color:var(--muted)}
+.seg button[aria-pressed="true"]{background:var(--surface);color:var(--ink);box-shadow:0 1px 2px rgba(0,0,0,.08)}
+.chips{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px;scrollbar-width:none}
+.chips button{flex:none}
+.chip{border:1px solid var(--line);background:var(--surface);border-radius:999px;padding:5px 11px;font-size:.8rem;font-weight:600;color:var(--muted)}
+.chip[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+
+/* home */
+.hero{display:grid;grid-template-columns:1fr;gap:16px}
+@media (min-width:720px){.hero{grid-template-columns:1.6fr 1fr}}
+.title-card h1{font-size:clamp(1.3rem,4.6vw,1.75rem);font-weight:700;margin:4px 0 8px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:.9rem;margin-top:12px}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0;font-weight:600;min-width:0}
+.ringwrap{display:flex;align-items:center;gap:16px}
+.ring text{font-family:var(--display)}
+.funnel{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:14px}
+.funnel div{background:var(--sunk);border-radius:9px;padding:8px 4px;text-align:center}
+.funnel b{display:block;font-family:var(--display);font-size:1.25rem;font-variant-numeric:tabular-nums}
+.funnel span{font-size:.68rem;color:var(--muted);font-weight:600;line-height:1.2;display:block}
+.bar{height:8px;background:var(--sunk);border-radius:99px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--accent);border-radius:99px}
+.theme-row{display:grid;grid-template-columns:1fr auto;gap:4px 10px;align-items:center;padding:6px 0}
+.theme-row .bar{grid-column:1 / -1}
+.rq{border-left:3px solid var(--lit);padding:2px 0 2px 12px}
+.rq + .rq{margin-top:12px}
+.check{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--line)}
+.check:first-child{border-top:0}
+.check input{width:19px;height:19px;margin:2px 0 0;accent-color:var(--good);flex:none}
+.check.done .ctext{color:var(--muted);text-decoration:line-through}
+.path{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:.8rem;font-weight:600;margin-top:10px}
+.path span{background:var(--sunk);border-radius:7px;padding:3px 8px}
+.path i{color:var(--muted);font-style:normal}
+
+/* chapters */
+.chapter{padding:0;overflow:hidden}
+.chapter-h{display:flex;gap:12px;align-items:center;padding:14px 16px}
+.chnum{font-family:var(--display);font-size:1.6rem;font-weight:700;color:var(--accent);width:30px;flex:none;text-align:center}
+.chapter-h .bar{margin-top:6px}
+.secs{border-top:1px solid var(--line);padding:4px 16px 10px}
+.sec{display:flex;align-items:center;gap:10px;justify-content:space-between;padding:8px 0;border-top:1px solid var(--line)}
+.sec:first-child{border-top:0}
+.sec span{min-width:0}
+.statbtn{flex:none}
+
+/* articles */
+.toolbar{display:flex;flex-direction:column;gap:10px;margin-bottom:12px}
+.search{width:100%;border:1px solid var(--line);background:var(--surface);border-radius:10px;padding:9px 12px}
+.art{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:12px 14px;display:block;width:100%;text-align:left}
+.art + .art{margin-top:10px}
+.art .cite{margin:6px 0;font-size:.92rem;overflow-wrap:anywhere}
+.rule{background:var(--info-soft);border-radius:10px;padding:10px 14px;font-size:.86rem;margin-bottom:12px}
+
+/* map */
+.mapbox{overflow:auto;border:1px solid var(--line);border-radius:var(--r);background:var(--surface);max-height:72vh;-webkit-overflow-scrolling:touch}
+.mapbox svg{display:block}
+.map-node{cursor:pointer}
+.map-label{font-family:var(--body);font-size:13px;fill:var(--ink);paint-order:stroke;stroke:var(--surface);stroke-width:4px;stroke-linejoin:round}
+.map-hub{font-family:var(--display);font-size:15px;font-weight:700;fill:var(--ink);paint-order:stroke;stroke:var(--surface);stroke-width:5px;stroke-linejoin:round}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:.78rem;color:var(--muted);margin:10px 0}
+.legend span{display:inline-flex;align-items:center;gap:5px}
+.legend i{width:10px;height:10px;border-radius:50%;display:inline-block}
+.idea{padding:10px 0;border-top:1px solid var(--line)}
+.idea:first-child{border-top:0}
+.idea p{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere}
+
+/* sheet */
+.scrim{position:fixed;inset:0;z-index:40;background:rgba(10,12,30,.45);display:flex;align-items:flex-end;justify-content:center}
+.sheet{background:var(--surface);width:100%;max-width:620px;max-height:92vh;overflow:auto;border-radius:16px 16px 0 0;padding:18px max(18px,env(safe-area-inset-right,0px)) calc(18px + env(safe-area-inset-bottom,0px)) max(18px,env(safe-area-inset-left,0px))}
+@media (min-width:700px){.scrim{align-items:center}.sheet{border-radius:16px}}
+.sheet-h{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+.field{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
+.field label{font-size:.8rem;font-weight:700;color:var(--muted)}
+.field input[type=text],.field input[type=number],.field input[type=url],.field select,.field textarea{width:100%;border:1px solid var(--line);background:var(--bg);border-radius:9px;padding:9px 11px}
+.field textarea{min-height:84px;resize:vertical}
+.field .cb{display:flex;gap:8px;align-items:flex-start;font-size:.9rem;font-weight:500;color:var(--ink)}
+.field .cb input{width:18px;height:18px;margin-top:2px;flex:none;accent-color:var(--accent)}
+.multi{max-height:180px;overflow:auto;border:1px solid var(--line);border-radius:9px;padding:6px 10px;background:var(--bg)}
+.hint{font-size:.78rem;color:var(--muted)}
+.sheet-f{display:flex;gap:8px;justify-content:space-between;flex-wrap:wrap;margin-top:6px;position:sticky;bottom:calc(-18px - env(safe-area-inset-bottom,0px));background:var(--surface);padding-block:10px}
+.toast{position:fixed;z-index:50;left:50%;transform:translateX(-50%);bottom:calc(140px + env(safe-area-inset-bottom,0px));background:var(--ink);color:var(--bg);padding:9px 16px;border-radius:10px;font-size:.88rem;font-weight:600;max-width:calc(100% - 32px)}
+.filecard{display:flex;gap:12px;align-items:center;padding:11px 0;border-top:1px solid var(--line)}
+.filecard:first-child{border-top:0}
+.ficon{width:38px;height:38px;border-radius:9px;background:var(--info-soft);color:var(--accent);display:grid;place-items:center;font-size:.66rem;font-weight:800;flex:none;font-family:var(--mono)}
+@media (prefers-reduced-motion:no-preference){.sheet{animation:up .18s ease-out}@keyframes up{from{transform:translateY(24px);opacity:.6}to{transform:none;opacity:1}}}
+</style>
+
+<header class="top"><div class="top-in">
+  <div class="mark" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 20 20" fill="none"><circle cx="5" cy="10" r="3" fill="#FFFFFF"/><path d="M8.5 10h4" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round"/><path d="M12 6l4 4-4 4" stroke="#F5B93A" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+  <div class="brand"><b>From Knowing to Doing</b><span>DHSc literature review dashboard</span></div>
+  <div class="sync"><i class="dot" id="syncDot"></i><span id="syncText">Connecting</span></div>
+</div></header>
+
+<div class="shell">
+  <nav class="rail" id="rail" aria-label="Sections"></nav>
+  <main id="main"><div id="banner"></div><div id="view"></div></main>
+</div>
+<nav class="tabs" id="tabs" aria-label="Sections"></nav>
+<button class="fab" id="fab" type="button" aria-label="Capture an idea"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>Idea</button>
+<div id="sheetRoot"></div>
+<div id="toastRoot"></div>
+
+<script>
+(function(){
+"use strict";
+/* ---------- constants ---------- */
+const TABS=[
+  {id:"home",label:"Home",icon:'<path d="M4 11l8-7 8 7v8a1 1 0 0 1-1 1h-4v-6H9v6H5a1 1 0 0 1-1-1z"/>'},
+  {id:"chapters",label:"Chapters",icon:'<path d="M5 4h10l4 4v12H5z"/><path d="M9 12h6M9 16h6M9 8h3"/>'},
+  {id:"articles",label:"Articles",icon:'<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h8M8 13h8M8 17h5"/>'},
+  {id:"ideas",label:"Ideas",icon:'<circle cx="12" cy="12" r="2.5"/><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="18" r="2"/><path d="M10 10.5L6.5 7.5M14 10.5l3.5-3M10.3 13.8l-3 3.6M13.8 13.8l2.8 2.8"/>'},
+  {id:"log",label:"Log",icon:'<path d="M7 4v16M4 8h6M4 16h6"/><path d="M13 7h7M13 12h7M13 17h5"/>'},
+  {id:"files",label:"Files",icon:'<path d="M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/>'}
+];
+const THEMES=[
+  {id:"promoting",short:"Health-promoting behaviors",full:"General health literacy and health-promoting behaviors",target:6},
+  {id:"selfmgmt",short:"Chronic disease self-management",full:"Health literacy and chronic disease self-management",target:6},
+  {id:"adherence",short:"Medication adherence",full:"Health literacy and medication adherence",target:5},
+  {id:"preventive",short:"Preventive healthcare",full:"Health literacy and preventive healthcare",target:4},
+  {id:"interventions",short:"Interventions",full:"Health literacy interventions and behavioral outcomes",target:4}
+];
+const HUBS=THEMES.map(t=>({id:t.id,short:t.short})).concat([
+  {id:"context",short:"Contextual factors"},{id:"gaps",short:"Research gaps"},{id:"unsorted",short:"Unsorted"}]);
+const HUB_BY=Object.fromEntries(HUBS.map(h=>[h.id,h]));
+const ART_STATUS=["Identified","Screening","Potentially eligible","Eligible","Excluded","Background only"];
+const SEC_STATUS=["Not started","Outlining","Drafting","Revising","Done"];
+const KINDS=[{id:"idea",label:"Idea",color:"var(--accent)"},{id:"finding",label:"Finding",color:"var(--good)"},{id:"gap",label:"Gap",color:"var(--bad)"},{id:"question",label:"Question",color:"var(--warn)"},{id:"practice",label:"Health Is Lit",color:"var(--lit)"}];
+const KIND_BY=Object.fromEntries(KINDS.map(k=>[k.id,k]));
+const GAP_TYPES=["Inconsistent findings","Underrepresented populations","Differences in health literacy measurement","Differences in behavioral outcomes","Limitations in existing research","Opportunities for future studies","Practical applications for Health Is Lit"];
+const ADV_TYPES=["Meeting","Recommendation","Decision","Question to clarify","Material submitted","Feedback received","Next step"];
+const COLS=["rqs","deadlines","milestones","chapters","articles","searches","ideas","advisor","files"];
+
+/* ---------- state ---------- */
+const S={meta:{},rqs:[],deadlines:[],milestones:[],chapters:[],articles:[],searches:[],ideas:[],advisor:[],files:[]};
+let db=null, assets=null, canWrite=true, loaded=false, loadTimer=null;
+const ui={artStatus:"All",artQuery:"",ideasView:"map",zoom:1,logView:"advisor",openCh:{}};
+
+/* ---------- helpers ---------- */
+const $=s=>document.querySelector(s);
+function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+function trunc(s,n){s=String(s||"");return s.length>n?s.slice(0,n-1)+"…":s;}
+function byOrder(a,b){return (a.order??9999)-(b.order??9999)||(a.createdAt||0)-(b.createdAt||0);}
+function newest(a,b){return (b.createdAt||0)-(a.createdAt||0);}
+function icon(p,sz){return '<svg viewBox="0 0 24 24" width="'+(sz||22)+'" height="'+(sz||22)+'" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">'+p+'</svg>';}
+function toast(msg){const r=$("#toastRoot");r.innerHTML='<div class="toast" role="status">'+esc(msg)+'</div>';clearTimeout(toast.t);toast.t=setTimeout(()=>{r.innerHTML="";},2600);}
+function errMsg(e){const c=e&&e.code;if(c==="quota_exceeded")return "Storage is full. Delete some entries or files, then try again.";if(c==="invalid_argument")return "That change could not be saved. You may have view-only access.";if(c==="file_too_large")return "That file is over the 20 MB limit.";return "Could not save right now. Check your connection and try again.";}
+function counts(){
+  const a=S.articles;
+  const counted=a.filter(x=>x.status==="Eligible"&&x.verified===true);
+  return {identified:a.length,screened:a.filter(x=>x.status&&x.status!=="Identified").length,verified:a.filter(x=>x.verified===true).length,eligible:a.filter(x=>x.status==="Eligible").length,excluded:a.filter(x=>x.status==="Excluded").length,counted:counted.length,countedList:counted};
+}
+function statusPill(s){const m={"Eligible":"good","Excluded":"bad","Potentially eligible":"info","Screening":"warn","Background only":"lit"};return '<span class="pill '+(m[s]||"")+'">'+esc(s||"Identified")+'</span>';}
+function secPill(s){const m={"Done":"good","Revising":"info","Drafting":"warn","Outlining":"lit"};return 'pill '+(m[s]||"");}
+
+/* ---------- data writes ---------- */
+function needDb(){if(!db){toast("Not connected yet. Open this page in Claude to save.");return false;}if(!canWrite){toast("You have view-only access to this dashboard.");return false;}return true;}
+async function put(col,id,data){if(!needDb())return false;try{if(id)await db.collection(col).doc(id).set(data);else await db.collection(col).add(data);return true;}catch(e){toast(errMsg(e));return false;}}
+async function patch(path,data){if(!needDb())return false;try{await db.doc(path).update(data);return true;}catch(e){toast(errMsg(e));return false;}}
+async function remove(col,id){if(!needDb())return false;try{await db.collection(col).doc(id).delete();return true;}catch(e){toast(errMsg(e));return false;}}
+function strip(o){const c={...o};delete c.id;return c;}
+
+/* ---------- form sheet ---------- */
+function openForm(o){
+  const data=o.data||{};
+  const root=$("#sheetRoot");
+  let h='<div class="scrim" id="scrim"><div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheetTitle"><div class="sheet-h"><h2 id="sheetTitle">'+esc(o.title)+'</h2><button class="btn ghost" type="button" data-close aria-label="Close">Close</button></div>';
+  if(o.intro)h+='<p class="small muted" style="margin:-4px 0 12px">'+o.intro+'</p>';
+  h+='<form id="sheetForm" novalidate>';
+  o.fields.forEach(f=>{
+    const id="f_"+f.k, v=data[f.k];
+    h+='<div class="field" data-k="'+f.k+'">';
+    if(f.type==="checkbox"){h+='<label class="cb"><input type="checkbox" id="'+id+'"'+(v===true?" checked":"")+'> <span>'+esc(f.label)+'</span></label>';}
+    else{
+      h+='<label for="'+id+'">'+esc(f.label)+'</label>';
+      if(f.type==="textarea")h+='<textarea id="'+id+'" rows="'+(f.rows||3)+'" placeholder="'+esc(f.ph||"")+'">'+esc(v)+'</textarea>';
+      else if(f.type==="select"){h+='<select id="'+id+'">';(f.options||[]).forEach(op=>{const val=typeof op==="object"?op.v:op, lab=typeof op==="object"?op.l:op;h+='<option value="'+esc(val)+'"'+(String(v??f.def??"")===String(val)?" selected":"")+'>'+esc(lab)+'</option>';});h+='</select>';}
+      else if(f.type==="multi"){const sel=Array.isArray(v)?v:[];h+='<div class="multi" id="'+id+'">';if(!f.options.length)h+='<span class="hint">Nothing to link yet.</span>';f.options.forEach(op=>{h+='<label class="cb" style="padding:4px 0"><input type="checkbox" value="'+esc(op.v)+'"'+(sel.includes(op.v)?" checked":"")+'> <span>'+esc(op.l)+'</span></label>';});h+='</div>';}
+      else h+='<input type="'+(f.type==="number"?"number":"text")+'" id="'+id+'" value="'+esc(v)+'" placeholder="'+esc(f.ph||"")+'"'+(f.type==="number"?' inputmode="numeric"':'')+'>';
+    }
+    if(f.hint)h+='<span class="hint">'+esc(f.hint)+'</span>';
+    h+='</div>';
+  });
+  h+='<div class="sheet-f"><div>'+(o.onDelete?'<button class="btn danger" type="button" id="delBtn">Delete</button>':'')+'</div><div class="row"><button class="btn" type="button" data-close>Cancel</button><button class="btn primary" type="submit">'+esc(o.saveLabel||"Save")+'</button></div></div></form></div></div>';
+  root.innerHTML=h;
+  const form=$("#sheetForm");
+  function values(){const out={};o.fields.forEach(f=>{const el=document.getElementById("f_"+f.k);if(!el)return;if(f.type==="checkbox")out[f.k]=el.checked;else if(f.type==="multi")out[f.k]=[...el.querySelectorAll("input:checked")].map(i=>i.value);else if(f.type==="number")out[f.k]=el.value===""?null:Number(el.value);else out[f.k]=el.value.trim();});return out;}
+  function applyShow(){const v=values();o.fields.forEach(f=>{if(f.showIf){const w=form.querySelector('[data-k="'+f.k+'"]');w.hidden=!f.showIf(v);}});}
+  applyShow();form.addEventListener("change",applyShow);
+  root.querySelectorAll("[data-close]").forEach(b=>b.onclick=closeSheet);
+  $("#scrim").addEventListener("click",e=>{if(e.target.id==="scrim")closeSheet();});
+  form.addEventListener("submit",async e=>{e.preventDefault();const v=values();if(o.required){for(const k of o.required){if(!v[k]){toast("Please fill in "+o.fields.find(f=>f.k===k).label.toLowerCase()+".");return;}}}const ok=await o.onSave(v);if(ok!==false)closeSheet();});
+  const del=$("#delBtn");if(del){let armed=false;del.onclick=async()=>{if(!armed){armed=true;del.textContent="Tap again to delete";return;}const ok=await o.onDelete();if(ok!==false)closeSheet();};}
+  const first=form.querySelector("textarea,input[type=text]");if(first&&!o.noFocus)setTimeout(()=>first.focus(),60);
+}
+function closeSheet(){$("#sheetRoot").innerHTML="";}
+document.addEventListener("keydown",e=>{if(e.key==="Escape")closeSheet();});
+
+/* ---------- routing ---------- */
+function current(){const h=location.hash.replace("#","");return TABS.some(t=>t.id===h)?h:"home";}
+function navHTML(){const c=current();return TABS.map(t=>'<button class="tab" type="button" data-nav="'+t.id+'"'+(t.id===c?' aria-current="page"':'')+'>'+icon(t.icon)+'<span>'+t.label+'</span></button>').join("");}
+window.addEventListener("hashchange",()=>{render(true);window.scrollTo(0,0);});
+let lastTab=null;
+function render(force){
+  $("#tabs").innerHTML=navHTML();$("#rail").innerHTML=navHTML();
+  const tab=current();
+  const v=$("#view");
+  const ae=document.activeElement;
+  if(!force&&tab===lastTab&&ae&&v.contains(ae)&&ae.matches("input[type=search],input[type=text],textarea,select")){ if(tab==="articles"){fillArticles();} return; }
+  lastTab=tab;
+  ({home:viewHome,chapters:viewChapters,articles:viewArticles,ideas:viewIdeas,log:viewLog,files:viewFiles})[tab](v);
+}
+document.addEventListener("click",e=>{const n=e.target.closest("[data-nav]");if(n){location.hash=n.dataset.nav;}});
+
+/* ---------- HOME ---------- */
+function viewHome(v){
+  const m=S.meta, c=counts(), pct=Math.min(1,c.counted/25);
+  const R=46, C=2*Math.PI*R;
+  const rqs=S.rqs.slice().sort(byOrder), dl=S.deadlines.slice().sort(byOrder), ms=S.milestones.slice().sort(byOrder);
+  const msDone=ms.filter(x=>x.done).length;
+  const openQ=S.advisor.filter(x=>x.type==="Question to clarify"&&x.status!=="Resolved");
+  let h='<div class="stack">';
+  if(window.OFFLINE&&!S.rqs.length&&!S.articles.length&&!S.chapters.length)h+='<div class="banner">Nothing is saved on this phone yet. Go to <a href="#files">Files</a> and import your dashboard file to load your chapters, studies and notes.</div>';
+  h+='<div class="hero"><section class="panel title-card"><div class="panel-h" style="margin-bottom:0"><span class="eyebrow">Working title</span><button class="btn ghost" data-act="editMeta">Edit</button></div>';
+  h+='<h1>'+(m.title?esc(m.title):'<span class="muted">Add your working title</span>')+'</h1>';
+  if(m.purpose)h+='<p class="muted" style="margin:0">'+esc(m.purpose)+'</p>';
+  h+='<div class="path" aria-label="Conceptual pathway"><span>Health information</span><i>→</i><span>Health literacy</span><i>→</i><span>Understanding and application</span><i>→</i><span>Health-related behaviors</span><i>→</i><span>Potential outcomes</span></div>';
+  h+='<dl class="kv"><dt>Advisor</dt><dd>'+esc(m.advisor||"Not set")+'</dd><dt>Stage</dt><dd>'+esc(m.stage||"Not set")+'</dd><dt>Next milestone</dt><dd>'+esc(m.nextMilestone||"Not set")+'</dd></dl></section>';
+  h+='<section class="panel"><span class="eyebrow">Toward 25 verified studies</span><div class="ringwrap" style="margin-top:8px"><svg class="ring" width="112" height="112" viewBox="0 0 112 112" role="img" aria-label="'+c.counted+' of 25 verified eligible studies"><circle cx="56" cy="56" r="'+R+'" fill="none" stroke="var(--sunk)" stroke-width="11"/><circle cx="56" cy="56" r="'+R+'" fill="none" stroke="var(--accent)" stroke-width="11" stroke-linecap="round" stroke-dasharray="'+(C*pct).toFixed(1)+' '+C.toFixed(1)+'" transform="rotate(-90 56 56)"/><text x="56" y="56" text-anchor="middle" font-size="27" font-weight="700" fill="var(--ink)">'+c.counted+'</text><text x="56" y="76" text-anchor="middle" font-size="12" fill="var(--muted)">of 25</text></svg><div class="small"><p style="margin:0 0 6px"><b>'+(25-c.counted>0?(25-c.counted)+' to go.':'Target reached.')+'</b></p><p class="muted" style="margin:0">Only articles marked Eligible and fully verified count here.</p></div></div>';
+  h+='<div class="funnel">'+[["Identified",c.identified],["Screened",c.screened],["Verified",c.verified],["Eligible",c.eligible],["Excluded",c.excluded]].map(x=>'<div><b>'+x[1]+'</b><span>'+x[0]+'</span></div>').join("")+'</div></section></div>';
+
+  h+='<div class="grid2">';
+  h+='<section class="panel"><div class="panel-h"><h3>Research questions</h3><button class="btn ghost" data-act="addRq">Add</button></div>';
+  if(!rqs.length)h+='<div class="empty">No research questions yet.</div>';
+  rqs.forEach(q=>{h+='<button class="tap rq" data-act="editRq" data-id="'+q.id+'"><div class="row"><b>'+esc(q.label)+'</b><span class="pill '+(q.status==="Final"?"good":q.status==="Dropped"?"bad":"warn")+'">'+esc(q.status||"Under consideration")+'</span></div><div style="margin-top:3px">'+esc(q.text)+'</div>'+(q.note?'<div class="small muted" style="margin-top:3px">'+esc(q.note)+'</div>':'')+'</button>';});
+  h+='</section>';
+
+  h+='<section class="panel"><div class="panel-h"><h3>Deadlines</h3><button class="btn ghost" data-act="addDeadline">Add</button></div><div class="list">';
+  if(!dl.length)h+='<div class="empty">No deadlines yet.</div>';
+  dl.forEach(d=>{h+='<button class="tap item" data-act="editDeadline" data-id="'+d.id+'"><div class="item-main"><b>'+esc(d.label)+'</b><div class="small muted">'+esc(d.note||"")+'</div></div><div style="text-align:right"><div class="mono">'+esc(d.date||"No date")+'</div>'+(d.confirmed?'<span class="pill good">Confirmed</span>':'<span class="pill warn">Not confirmed</span>')+'</div></button>';});
+  h+='</div>';
+  if(openQ.length)h+='<p class="small" style="margin:12px 0 0"><a href="#log">'+openQ.length+' open question'+(openQ.length>1?"s":"")+' for your advisor</a></p>';
+  h+='</section></div>';
+
+  h+='<div class="grid2">';
+  h+='<section class="panel"><div class="panel-h"><h3>Studies by theme</h3><span class="small muted">verified / suggested</span></div>';
+  THEMES.forEach(t=>{const n=c.countedList.filter(a=>a.theme===t.id).length;h+='<div class="theme-row"><span class="small">'+esc(t.short)+'</span><span class="mono">'+n+' / '+t.target+'</span><div class="bar"><i style="width:'+Math.min(100,n/t.target*100)+'%"></i></div></div>';});
+  const multi=c.countedList.filter(a=>!THEMES.some(t=>t.id===a.theme)).length;
+  if(multi)h+='<p class="small muted" style="margin:6px 0 0">'+multi+' counted article'+(multi>1?"s":"")+' tagged to several themes or none.</p>';
+  h+='<p class="small muted" style="margin:8px 0 0">The suggested split is a guide, not a quota.</p></section>';
+
+  h+='<section class="panel"><div class="panel-h"><h3>Milestones</h3><div class="row"><span class="small muted">'+msDone+' of '+ms.length+'</span><button class="btn ghost" data-act="addMilestone">Add</button></div></div>';
+  if(!ms.length)h+='<div class="empty">No milestones yet.</div>';
+  ms.forEach(x=>{h+='<div class="check'+(x.done?" done":"")+'"><input type="checkbox" aria-label="Mark done" data-act="toggleMs" data-id="'+x.id+'"'+(x.done?" checked":"")+'><button class="tap ctext" data-act="editMilestone" data-id="'+x.id+'">'+esc(x.title)+(x.due?' <span class="mono muted">'+esc(x.due)+'</span>':'')+'</button></div>';});
+  h+='</section></div>';
+
+  const recent=S.ideas.slice().sort(newest).slice(0,3);
+  h+='<section class="panel"><div class="panel-h"><h3>Latest ideas</h3><a class="btn ghost" href="#ideas">Open map</a></div>';
+  if(!recent.length)h+='<div class="empty">Tap Idea to capture a thought on the go.</div>';
+  recent.forEach(i=>{h+=ideaRow(i);});
+  h+='</section></div>';
+  v.innerHTML=h;
+}
+function ideaRow(i){const k=KIND_BY[i.kind]||KINDS[0];const hub=HUB_BY[i.theme]||HUB_BY.unsorted;return '<button class="tap idea" data-act="editIdea" data-id="'+i.id+'"><div class="row"><span class="pill" style="color:'+k.color+'">'+esc(k.label)+'</span><span class="small muted">'+esc(hub.short)+'</span>'+(i.source?'<span class="mono muted">'+esc(i.source)+'</span>':'')+'</div><p>'+esc(i.text)+'</p></button>';}
+
+/* ---------- CHAPTERS ---------- */
+function viewChapters(v){
+  const ch=S.chapters.slice().sort(byOrder);
+  let h='<div class="stack"><div class="panel-h" style="margin:0"><div><h2>Dissertation outline</h2><p class="small muted" style="margin:2px 0 0">Tap a status to move it forward. Structure follows the DHSc Program Manual.</p></div><button class="btn" data-act="addChapter">Add</button></div>';
+  if(!ch.length)h+='<div class="empty">Your chapter outline will appear here once it loads.</div>';
+  ch.forEach(c=>{
+    const secs=Array.isArray(c.sections)?c.sections:[];
+    const done=secs.filter(s=>s.s==="Done").length;
+    const score=secs.length?secs.reduce((a,s)=>a+Math.max(0,SEC_STATUS.indexOf(s.s||"Not started")),0)/(secs.length*4):0;
+    h+='<section class="panel chapter"><div class="chapter-h"><span class="chnum">'+esc(c.num||"")+'</span><div class="item-main"><h3>'+esc(c.title)+'</h3><div class="small muted">'+done+' of '+secs.length+' sections done</div><div class="bar"><i style="width:'+(score*100).toFixed(0)+'%"></i></div></div><button class="btn ghost" data-act="editChapter" data-id="'+c.id+'">Edit</button></div>';
+    if(c.note)h+='<p class="small muted" style="margin:0 16px 10px">'+esc(c.note)+'</p>';
+    h+='<div class="secs">';
+    secs.forEach((s,ix)=>{h+='<div class="sec"><span class="small">'+esc(s.t)+'</span><button class="'+secPill(s.s)+' statbtn" data-act="cycleSec" data-id="'+c.id+'" data-ix="'+ix+'" aria-label="Status: '+esc(s.s||"Not started")+'. Tap to change.">'+esc(s.s||"Not started")+'</button></div>';});
+    if(!secs.length)h+='<p class="small muted">No sections yet. Tap Edit to add them.</p>';
+    h+='</div></section>';
+  });
+  h+='</div>';v.innerHTML=h;
+}
+
+/* ---------- ARTICLES ---------- */
+function viewArticles(v){
+  let h='<div class="panel-h"><div><h2>Article tracker</h2><p class="small muted" style="margin:2px 0 0" id="artSummary"></p></div><button class="btn primary" data-act="addArticle">Add article</button></div>';
+  h+='<div class="rule">An article counts toward the 25 only when it is marked <b>Eligible</b> and <b>Verified</b>: publication details, study design, population, health literacy component and behavioral outcome all checked. Quantitative primary studies from 2021 on. No reviews, meta-analyses or qualitative-only studies.</div>';
+  h+='<div class="toolbar"><input class="search" id="artQuery" type="search" placeholder="Search citation, author, behavior, country" value="'+esc(ui.artQuery)+'" aria-label="Search articles"><div class="chips" id="artChips"></div></div><div id="artList"></div>';
+  v.innerHTML=h;
+  $("#artQuery").addEventListener("input",e=>{ui.artQuery=e.target.value;fillArticles();});
+  fillArticles();
+}
+function fillArticles(){
+  const c=counts();
+  const sum=$("#artSummary");if(sum)sum.textContent=c.identified+" tracked, "+c.counted+" counting toward 25";
+  const chips=$("#artChips");
+  if(chips)chips.innerHTML=["All","Counting"].concat(ART_STATUS).map(s=>{const n=s==="All"?S.articles.length:s==="Counting"?c.counted:S.articles.filter(a=>(a.status||"Identified")===s).length;return '<button class="chip" data-act="artFilter" data-v="'+esc(s)+'" aria-pressed="'+(ui.artStatus===s)+'">'+esc(s)+' '+n+'</button>';}).join("");
+  const q=ui.artQuery.toLowerCase();
+  let list=S.articles.slice().sort((a,b)=>String(a.aid||"").localeCompare(String(b.aid||""),undefined,{numeric:true})||newest(a,b));
+  if(ui.artStatus==="Counting")list=list.filter(a=>a.status==="Eligible"&&a.verified===true);
+  else if(ui.artStatus!=="All")list=list.filter(a=>(a.status||"Identified")===ui.artStatus);
+  if(q)list=list.filter(a=>["aid","citation","country","behavior","population","hlMeasure","design","notes","findings"].some(k=>String(a[k]||"").toLowerCase().includes(q)));
+  let h="";
+  if(!S.articles.length)h='<div class="empty">No articles yet. Verified studies from the literature search will be added here, and you can add your own with Add article.</div>';
+  else if(!list.length)h='<div class="empty">No articles match this filter.</div>';
+  list.forEach(a=>{const th=THEMES.find(t=>t.id===a.theme);h+='<button class="art" data-act="editArticle" data-id="'+a.id+'"><div class="row"><span class="mono">'+esc(a.aid||"No ID")+'</span>'+statusPill(a.status)+(a.verified?'<span class="pill good">Verified</span>':'<span class="pill">Not verified</span>')+(a.year?'<span class="mono muted">'+esc(a.year)+'</span>':'')+'</div><div class="cite">'+(a.citation?esc(trunc(a.citation,220)):'<span class="muted">No citation yet</span>')+'</div><div class="small muted">'+[a.design,a.country,a.n?("n = "+a.n):"",a.behavior,th?th.short:""].filter(Boolean).map(esc).join(" · ")+'</div></button>';});
+  const l=$("#artList");if(l)l.innerHTML=h;
+}
+const ART_FIELDS=[
+  {k:"aid",label:"Article ID",ph:"A01"},
+  {k:"citation",label:"APA 7 citation",type:"textarea",rows:4},
+  {k:"doi",label:"DOI or URL",ph:"https://doi.org/..."},
+  {k:"year",label:"Publication year",type:"number"},
+  {k:"country",label:"Country"},
+  {k:"design",label:"Study design",type:"select",options:["Not yet checked","Cross-sectional","Cohort","Longitudinal","Randomized controlled trial","Quasi-experimental","Other quantitative"]},
+  {k:"n",label:"Sample size"},
+  {k:"population",label:"Population"},
+  {k:"hlMeasure",label:"Health literacy measure",ph:"Instrument used"},
+  {k:"behavior",label:"Health behavior measured"},
+  {k:"theme",label:"Main theme",type:"select",options:THEMES.map(t=>({v:t.id,l:t.short})).concat([{v:"multiple",l:"Several themes"}])},
+  {k:"findings",label:"Main findings",type:"textarea"},
+  {k:"limitations",label:"Limitations",type:"textarea"},
+  {k:"rq",label:"Relevance to research question",type:"select",options:["Unclear","RQ1","RQ2","Both"]},
+  {k:"status",label:"Eligibility status",type:"select",options:ART_STATUS},
+  {k:"verified",label:"Verified: publication details, design, population, health literacy component and behavioral outcome all checked",type:"checkbox"},
+  {k:"fullText",label:"Full text",type:"select",options:["Not checked","Available","Requested","Not available"]},
+  {k:"notes",label:"Notes",type:"textarea"}
+];
+
+/* ---------- IDEAS ---------- */
+function viewIdeas(v){
+  let h='<div class="panel-h"><div><h2>Brain map</h2><p class="small muted" style="margin:2px 0 0">Connect ideas, findings and gaps to the themes of Chapter 2.</p></div><button class="btn primary" data-act="addIdea">Add</button></div>';
+  h+='<div class="seg" role="group" aria-label="View" style="margin-bottom:12px">'+[["map","Map"],["synthesis","Synthesis"],["gaps","Gaps"],["all","All ideas"]].map(x=>'<button data-act="ideasView" data-v="'+x[0]+'" aria-pressed="'+(ui.ideasView===x[0])+'">'+x[1]+'</button>').join("")+'</div>';
+  if(ui.ideasView==="map"){
+    h+='<div class="row" style="justify-content:space-between;margin-bottom:8px"><div class="legend" style="margin:0">'+KINDS.map(k=>'<span><i style="background:'+k.color+'"></i>'+k.label+'</span>').join("")+'</div><div class="row"><button class="btn" data-act="zoom" data-v="-1" aria-label="Zoom out">−</button><button class="btn" data-act="zoom" data-v="1" aria-label="Zoom in">+</button></div></div>';
+    h+='<div class="mapbox" id="mapbox">'+mapSVG()+'</div><p class="small muted">Tap any dot to read or edit it. Dashed lines are links you made between ideas.</p>';
+  } else if(ui.ideasView==="synthesis"){
+    const c=counts();
+    h+='<div class="stack">';
+    HUBS.filter(x=>x.id!=="gaps").forEach(hub=>{const list=S.ideas.filter(i=>(i.theme||"unsorted")===hub.id&&i.kind!=="gap").sort(newest);const n=c.countedList.filter(a=>a.theme===hub.id).length;if(hub.id==="unsorted"&&!list.length)return;h+='<section class="panel"><div class="panel-h"><h3>'+esc(hub.short)+'</h3>'+(THEMES.some(t=>t.id===hub.id)?'<span class="pill info">'+n+' verified studies</span>':'')+'</div>'+(list.length?list.map(ideaRow).join(""):'<div class="empty">Nothing here yet.</div>')+'</section>';});
+    h+='</div>';
+  } else if(ui.ideasView==="gaps"){
+    const gaps=S.ideas.filter(i=>i.kind==="gap"||i.theme==="gaps");
+    h+='<div class="stack">';
+    GAP_TYPES.concat(["Not categorized"]).forEach(g=>{const list=gaps.filter(i=>(GAP_TYPES.includes(i.gapType)?i.gapType:"Not categorized")===g).sort(newest);if(g==="Not categorized"&&!list.length)return;h+='<section class="panel"><div class="panel-h"><h3>'+esc(g)+'</h3><button class="btn ghost" data-act="addGap" data-v="'+esc(g)+'">Add</button></div>'+(list.length?list.map(ideaRow).join(""):'<div class="empty">Nothing recorded yet.</div>')+'</section>';});
+    h+='</div>';
+  } else {
+    const list=S.ideas.slice().sort(newest);
+    h+='<section class="panel">'+(list.length?list.map(ideaRow).join(""):'<div class="empty">No ideas yet.</div>')+'</section>';
+  }
+  v.innerHTML=h;
+  centerMap();
+}
+function centerMap(){const b=$("#mapbox");if(!b)return;b.scrollLeft=(b.scrollWidth-b.clientWidth)/2;b.scrollTop=(b.scrollHeight-b.clientHeight)/2;}
+function mapSVG(){
+  const W=1000,H=1000,cx=500,cy=500,R=290;
+  const n=HUBS.length, pos={}, hubPos={};
+  HUBS.forEach((hb,i)=>{const a=(-90+i*360/n)*Math.PI/180;hubPos[hb.id]={x:cx+R*Math.cos(a),y:cy+R*Math.sin(a),a};});
+  const groups={};S.ideas.forEach(i=>{const t=HUB_BY[i.theme]?i.theme:"unsorted";(groups[t]=groups[t]||[]).push(i);});
+  Object.keys(groups).forEach(t=>{const g=groups[t].sort((a,b)=>(a.createdAt||0)-(b.createdAt||0));const hp=hubPos[t];const k=g.length;const step=Math.min(30,200/Math.max(k,1))*Math.PI/180;
+    g.forEach((idea,j)=>{const ang=hp.a+(j-(k-1)/2)*step;const r=105+(j%3)*48;pos[idea.id]={x:hp.x+r*Math.cos(ang),y:hp.y+r*Math.sin(ang),hub:t};});});
+  const sz=Math.round(720*ui.zoom);
+  let s='<svg viewBox="0 0 '+W+' '+H+'" width="'+sz+'" height="'+sz+'" style="min-width:100%" role="img" aria-label="Brain map of ideas grouped by theme">';
+  HUBS.forEach(hb=>{const p=hubPos[hb.id];s+='<line x1="'+cx+'" y1="'+cy+'" x2="'+p.x.toFixed(1)+'" y2="'+p.y.toFixed(1)+'" stroke="var(--line)" stroke-width="2"/>';});
+  S.ideas.forEach(i=>{const p=pos[i.id],hp=hubPos[p.hub];s+='<line x1="'+hp.x.toFixed(1)+'" y1="'+hp.y.toFixed(1)+'" x2="'+p.x.toFixed(1)+'" y2="'+p.y.toFixed(1)+'" stroke="var(--line)" stroke-width="1.5"/>';});
+  const seen={};S.ideas.forEach(i=>{(Array.isArray(i.links)?i.links:[]).forEach(l=>{const key=[i.id,l].sort().join("|");if(seen[key]||!pos[l])return;seen[key]=1;const a=pos[i.id],b=pos[l];s+='<line x1="'+a.x.toFixed(1)+'" y1="'+a.y.toFixed(1)+'" x2="'+b.x.toFixed(1)+'" y2="'+b.y.toFixed(1)+'" stroke="var(--lit)" stroke-width="2" stroke-dasharray="6 5"/>';});});
+  s+='<circle cx="'+cx+'" cy="'+cy+'" r="64" fill="var(--accent)"/><text x="'+cx+'" y="'+(cy-6)+'" text-anchor="middle" font-family="var(--display)" font-size="17" font-weight="700" fill="var(--accent-ink)">From Knowing</text><text x="'+cx+'" y="'+(cy+16)+'" text-anchor="middle" font-family="var(--display)" font-size="17" font-weight="700" fill="var(--accent-ink)">to Doing</text>';
+  HUBS.forEach(hb=>{const p=hubPos[hb.id];const below=p.y>=cy-1;s+='<g class="map-node" data-act="hub" data-v="'+hb.id+'" tabindex="0" role="button" aria-label="'+esc(hb.short)+'"><circle cx="'+p.x.toFixed(1)+'" cy="'+p.y.toFixed(1)+'" r="15" fill="var(--surface)" stroke="var(--accent)" stroke-width="3"/><text class="map-hub" x="'+p.x.toFixed(1)+'" y="'+(p.y+(below?36:-24)).toFixed(1)+'" text-anchor="middle">'+esc(hb.short)+'</text></g>';});
+  S.ideas.forEach(i=>{const p=pos[i.id],k=KIND_BY[i.kind]||KINDS[0];s+='<g class="map-node" data-act="editIdea" data-id="'+i.id+'" tabindex="0" role="button" aria-label="'+esc(trunc(i.text,80))+'"><circle cx="'+p.x.toFixed(1)+'" cy="'+p.y.toFixed(1)+'" r="9" fill="'+k.color+'" stroke="var(--surface)" stroke-width="2"/><text class="map-label" x="'+p.x.toFixed(1)+'" y="'+(p.y+24).toFixed(1)+'" text-anchor="middle">'+esc(trunc(i.text,24))+'</text></g>';});
+  return s+'</svg>';
+}
+function ideaFields(exclude){
+  return [
+    {k:"text",label:"Idea",type:"textarea",rows:4,ph:"What did you notice or think of?"},
+    {k:"kind",label:"Type",type:"select",options:KINDS.map(k=>({v:k.id,l:k.label})),def:"idea"},
+    {k:"theme",label:"Theme",type:"select",options:HUBS.map(h=>({v:h.id,l:h.short})),def:"unsorted"},
+    {k:"gapType",label:"Gap category",type:"select",options:[""].concat(GAP_TYPES).map(g=>({v:g,l:g||"Choose a category"})),showIf:v=>v.kind==="gap"||v.theme==="gaps"},
+    {k:"source",label:"Source (optional)",ph:"Article ID, meeting, or reading",hint:"Link a finding to an article ID so it can be traced back."},
+    {k:"links",label:"Connect to other ideas",type:"multi",options:S.ideas.filter(i=>i.id!==exclude).sort(newest).map(i=>({v:i.id,l:trunc(i.text,70)}))}
+  ];
+}
+function ideaForm(idea,defaults){
+  const isNew=!idea;
+  openForm({title:isNew?"Capture an idea":"Idea",fields:ideaFields(idea&&idea.id),data:idea||Object.assign({kind:"idea",theme:"unsorted"},defaults||{}),required:["text"],noFocus:!isNew,
+    onSave:v=>put("ideas",idea&&idea.id,Object.assign({},idea?strip(idea):{createdAt:Date.now()},v,{updatedAt:Date.now()})),
+    onDelete:idea?()=>remove("ideas",idea.id):null});
+}
+
+/* ---------- LOG ---------- */
+function viewLog(v){
+  let h='<div class="panel-h"><h2>Records</h2></div><div class="seg" role="group" aria-label="Record type" style="margin-bottom:12px"><button data-act="logView" data-v="advisor" aria-pressed="'+(ui.logView==="advisor")+'">Advisor and decisions</button><button data-act="logView" data-v="search" aria-pressed="'+(ui.logView==="search")+'">Search log</button></div>';
+  if(ui.logView==="advisor"){
+    const open=S.advisor.filter(a=>a.type==="Question to clarify"&&a.status!=="Resolved");
+    const rest=S.advisor.filter(a=>!open.includes(a)).sort((a,b)=>String(b.date||"").localeCompare(String(a.date||""))||newest(a,b));
+    h+='<div class="stack"><section class="panel"><div class="panel-h"><h3>Open questions for Dr. Rae</h3><button class="btn ghost" data-act="addAdvisor" data-v="Question to clarify">Add</button></div>'+(open.length?'<div class="list">'+open.sort(byOrder).map(advRow).join("")+'</div>':'<div class="empty">No open questions.</div>')+'</section>';
+    h+='<section class="panel"><div class="panel-h"><h3>Meetings, recommendations and decisions</h3><button class="btn ghost" data-act="addAdvisor" data-v="Meeting">Add</button></div>'+(rest.length?'<div class="list">'+rest.map(advRow).join("")+'</div>':'<div class="empty">Nothing recorded yet.</div>')+'</section></div>';
+  } else {
+    const list=S.searches.slice().sort((a,b)=>String(b.date||"").localeCompare(String(a.date||""))||byOrder(a,b));
+    h+='<div class="panel-h"><p class="small muted" style="margin:0">Record each database search so Chapter 3 can report it.</p><button class="btn primary" data-act="addSearch">Log a search</button></div>';
+    if(!list.length)h+='<div class="empty">No searches logged yet.</div>';
+    list.forEach(s=>{h+='<button class="art" data-act="editSearch" data-id="'+s.id+'"><div class="row"><b>'+esc(s.label||s.database||"Search")+'</b><span class="pill '+(s.status==="Run"?"good":"warn")+'">'+esc(s.status||"Planned")+'</span>'+(s.database?'<span class="small muted">'+esc(s.database)+'</span>':'')+(s.date?'<span class="mono muted">'+esc(s.date)+'</span>':'')+'</div><div class="cite mono" style="white-space:pre-wrap">'+esc(s.string)+'</div><div class="small muted">'+(s.status==="Run"?[["Results",s.results],["Screened",s.screened],["Retained",s.retained]].map(x=>x[0]+": "+(x[1]??"–")).join(" · "):"Not run yet")+(s.filters?" · Filters: "+esc(s.filters):"")+'</div></button>';});
+  }
+  v.innerHTML=h;
+}
+function advRow(a){const tone={"Decision":"good","Question to clarify":"warn","Recommendation":"info","Feedback received":"info","Material submitted":"lit","Next step":"lit"}[a.type]||"";return '<button class="tap item" data-act="editAdvisor" data-id="'+a.id+'"><div class="item-main"><div class="row"><span class="pill '+tone+'">'+esc(a.type||"Note")+'</span>'+(a.date?'<span class="mono muted">'+esc(a.date)+'</span>':'')+(a.status==="Resolved"?'<span class="pill good">Resolved</span>':'')+'</div><div style="margin-top:4px;white-space:pre-wrap">'+esc(a.text)+'</div></div></button>';}
+const ADV_FIELDS=[{k:"type",label:"Type",type:"select",options:ADV_TYPES},{k:"date",label:"Date",ph:"e.g. 2026-11-20"},{k:"text",label:"Details",type:"textarea",rows:4},{k:"status",label:"Status",type:"select",options:["Open","Resolved"]}];
+const SEARCH_FIELDS=[{k:"label",label:"Name",ph:"Search 1: General health literacy and behavior"},{k:"status",label:"Status",type:"select",options:["Planned","Run"]},{k:"database",label:"Database",ph:"PubMed, CINAHL, Scopus..."},{k:"date",label:"Date searched",ph:"YYYY-MM-DD"},{k:"string",label:"Search string",type:"textarea",rows:4},{k:"filters",label:"Filters applied",ph:"2021 to present, English, adults"},{k:"results",label:"Number of results",type:"number"},{k:"screened",label:"Number screened",type:"number"},{k:"retained",label:"Number retained",type:"number"},{k:"notes",label:"Notes on refinements",type:"textarea"}];
+
+/* ---------- FILES ---------- */
+function viewFiles(v){
+  const list=S.files.slice().sort(newest);
+  let h='<div class="panel-h"><div><h2>Context and files</h2><p class="small muted" style="margin:2px 0 0">Meeting notes, PDFs, screenshots, links to LiveBinders or saved articles.</p></div></div>';
+  h+='<div class="row" style="margin-bottom:12px"><label class="btn primary" for="fileIn" '+(assets?'':'aria-disabled="true" style="opacity:.5"')+'>'+icon('<path d="M12 16V4M7 9l5-5 5 5M5 20h14"/>',18)+'Upload file</label><input type="file" id="fileIn" hidden '+(assets?'':'disabled')+' accept="image/*,application/pdf,text/plain,text/markdown,text/csv,application/json,.md,.txt,.csv"><button class="btn" data-act="addLink">'+icon('<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',18)+'Add link</button><button class="btn" data-act="addNote">Add note</button></div>';
+  if(!assets)h+='<p class="small muted" style="margin:-4px 0 12px">Uploads are available to editors when the page is open in Claude.</p>';
+  if(window.OFFLINE){h+='<section class="panel" style="margin-bottom:16px"><div class="panel-h"><h3>Backup and import</h3><span class="small muted" id="lastBk"></span></div><p class="small muted" style="margin:0 0 10px">Everything is saved on this phone only. Download a backup now and then. To bring in new studies or another device\'s changes, import a dashboard file.</p><div class="row"><button class="btn primary" data-act="exportBackup">Download backup</button><label class="btn" for="importIn">Import file</label><input type="file" id="importIn" hidden accept="application/json,.json"><select id="importMode" class="btn" aria-label="How to import"><option value="merge">Add and update</option><option value="replace">Replace everything</option></select></div><p class="hint" id="importMsg" style="margin:8px 0 0">Add and update keeps your own entries and updates any with the same ID. Uploaded files stay on the phone and are not included in backups.</p></section>';}
+  h+='<section class="panel">';
+  if(!list.length)h+='<div class="empty">Nothing added yet. Upload a PDF or photo, or paste a link.</div>';
+  list.forEach(f=>{const ext=f.kind==="link"?"LINK":f.kind==="note"?"NOTE":(String(f.name||"").split(".").pop()||"FILE").slice(0,4).toUpperCase();const href=f.kind==="link"?f.url:(f.assetId?"/_blob/"+f.assetId:null);
+    h+='<div class="filecard"><span class="ficon">'+esc(ext)+'</span><div class="item-main">'+(href?'<a href="'+esc(href)+'" target="_blank" rel="noopener"><b>'+esc(f.name||f.url)+'</b></a>':'<b>'+esc(f.name)+'</b>')+'<div class="small muted" style="white-space:pre-wrap">'+esc(f.note||"")+'</div><div class="mono muted">'+new Date(f.createdAt||0).toLocaleDateString()+(f.size?" · "+(f.size/1024/1024).toFixed(1)+" MB":"")+'</div></div><button class="btn ghost" data-act="editFile" data-id="'+f.id+'">Edit</button></div>';});
+  h+='</section>';
+  v.innerHTML=h;
+  const fi=$("#fileIn");if(fi)fi.addEventListener("change",onUpload);
+  if(window.OFFLINE){const ii=$("#importIn");if(ii)ii.addEventListener("change",onImport);window.offlineData.lastBackup().then(t=>{const el=$("#lastBk");if(el)el.textContent=t?"Last backup "+new Date(t).toLocaleDateString():"No backup yet";});}
+}
+async function onUpload(e){
+  const file=e.target.files&&e.target.files[0];e.target.value="";if(!file||!assets||!needDb())return;
+  const ext=(file.name.split(".").pop()||"").toLowerCase();const map={md:"text/markdown",txt:"text/plain",csv:"text/csv",json:"application/json",pdf:"application/pdf"};
+  const opts=(!file.type||file.type.includes(";")||ext in map)&&map[ext]?{type:map[ext]}:undefined;
+  toast("Uploading "+file.name+"...");
+  try{const r=await assets.upload(file,opts);await put("files",null,{kind:"file",name:file.name,assetId:r.id,contentType:r.contentType,size:r.sizeBytes,note:"",createdAt:Date.now()});toast("Uploaded "+file.name);}
+  catch(err){toast(err&&err.code==="unsupported_type"?"That file type is not supported. Try PDF, an image, or a text file.":errMsg(err));}
+}
+
+/* ---------- offline backup ---------- */
+async function onImport(e){
+  const file=e.target.files&&e.target.files[0];e.target.value="";if(!file)return;
+  const mode=($("#importMode")||{}).value||"merge";const msg=$("#importMsg");
+  if(mode==="replace"&&!onImport.armed){onImport.armed=true;if(msg)msg.textContent="Replace everything deletes what is on this phone first. Choose the file again to confirm.";return;}
+  onImport.armed=false;
+  try{const obj=JSON.parse(await file.text());const n=await window.offlineData.importObject(obj,mode);toast("Imported "+n+" entries");if(msg)msg.textContent="Imported "+n+" entries from "+file.name+".";}
+  catch(err){toast("Could not import that file");if(msg)msg.textContent=(err&&err.message)||"That file could not be read.";}
+}
+async function exportBackup(){
+  const data=JSON.stringify(window.offlineData.exportObject());
+  const name="knowing-to-doing-backup-"+new Date().toISOString().slice(0,10)+".json";
+  const file=new File([data],name,{type:"application/json"});
+  try{if(navigator.canShare&&navigator.canShare({files:[file]})){await navigator.share({files:[file],title:name});await window.offlineData.markBackup();render(true);return;}}catch(err){if(err&&err.name==="AbortError")return;}
+  const a=document.createElement("a");a.href=URL.createObjectURL(file);a.download=name;document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},2000);
+  await window.offlineData.markBackup();render(true);
+}
+
+/* ---------- actions ---------- */
+const META_FIELDS=[{k:"title",label:"Working title",type:"textarea",rows:3},{k:"purpose",label:"Research purpose",type:"textarea",rows:3},{k:"advisor",label:"Advisor"},{k:"stage",label:"Current stage"},{k:"nextMilestone",label:"Next milestone",type:"textarea",rows:2}];
+const RQ_FIELDS=[{k:"label",label:"Label",ph:"RQ1"},{k:"text",label:"Question",type:"textarea",rows:3},{k:"status",label:"Status",type:"select",options:["Under consideration","Alternative","Final","Dropped"]},{k:"note",label:"Note",type:"textarea",rows:2},{k:"order",label:"Order",type:"number"}];
+const DL_FIELDS=[{k:"label",label:"What is due"},{k:"date",label:"Date",ph:"YYYY-MM-DD"},{k:"confirmed",label:"Date confirmed",type:"checkbox"},{k:"note",label:"Note",type:"textarea",rows:2},{k:"order",label:"Order",type:"number"}];
+const MS_FIELDS=[{k:"title",label:"Milestone",type:"textarea",rows:2},{k:"due",label:"Target date (optional)"},{k:"done",label:"Done",type:"checkbox"},{k:"order",label:"Order",type:"number"}];
+const find=(col,id)=>S[col].find(x=>x.id===id);
+function simpleEdit(col,fields,title,item,extra,req){openForm({title,fields,data:item||extra||{},required:req,noFocus:!!item,onSave:v=>put(col,item&&item.id,Object.assign({},item?strip(item):{createdAt:Date.now()},extra||{},v)),onDelete:item?()=>remove(col,item.id):null});}
+const nextOrder=col=>S[col].reduce((m,x)=>Math.max(m,x.order||0),0)+1;
+
+document.addEventListener("click",async e=>{
+  const t=e.target.closest("[data-act]");if(!t)return;
+  const act=t.dataset.act,id=t.dataset.id,val=t.dataset.v;
+  switch(act){
+    case "editMeta":openForm({title:"Project overview",fields:META_FIELDS,data:S.meta,noFocus:true,onSave:v=>needDb()&&db.doc("meta/overview").set(Object.assign({},S.meta,v)).then(()=>true,er=>{toast(errMsg(er));return false;})});break;
+    case "addRq":simpleEdit("rqs",RQ_FIELDS,"Add research question",null,{order:nextOrder("rqs"),status:"Under consideration"},["text"]);break;
+    case "editRq":simpleEdit("rqs",RQ_FIELDS,"Research question",find("rqs",id));break;
+    case "addDeadline":simpleEdit("deadlines",DL_FIELDS,"Add deadline",null,{order:nextOrder("deadlines")},["label"]);break;
+    case "editDeadline":simpleEdit("deadlines",DL_FIELDS,"Deadline",find("deadlines",id));break;
+    case "addMilestone":simpleEdit("milestones",MS_FIELDS,"Add milestone",null,{order:nextOrder("milestones"),done:false},["title"]);break;
+    case "editMilestone":simpleEdit("milestones",MS_FIELDS,"Milestone",find("milestones",id));break;
+    case "toggleMs":{const ok=await patch("milestones/"+id,{done:t.checked});if(!ok)t.checked=!t.checked;break;}
+    case "cycleSec":{const c=find("chapters",id);if(!c)break;const secs=c.sections.map(s=>({...s}));const s=secs[+t.dataset.ix];s.s=SEC_STATUS[(SEC_STATUS.indexOf(s.s||"Not started")+1)%SEC_STATUS.length];patch("chapters/"+id,{sections:secs});break;}
+    case "addChapter":case "editChapter":{const c=id?find("chapters",id):null;openForm({title:c?"Edit chapter":"Add chapter",noFocus:!!c,required:["title"],fields:[{k:"num",label:"Number",ph:"6"},{k:"title",label:"Title"},{k:"note",label:"Note",type:"textarea",rows:2},{k:"secs",label:"Sections, one per line",type:"textarea",rows:8,hint:"Status is kept for sections whose names stay the same."}],data:c?{num:c.num,title:c.title,note:c.note,secs:(c.sections||[]).map(s=>s.t).join("\n")}:{num:String(S.chapters.length+1)},
+      onSave:v=>{const old=Object.fromEntries((c&&c.sections||[]).map(s=>[s.t,s.s]));const sections=v.secs.split("\n").map(x=>x.trim()).filter(Boolean).map(x=>({t:x,s:old[x]||"Not started"}));return put("chapters",c&&c.id,Object.assign({},c?strip(c):{order:nextOrder("chapters"),createdAt:Date.now()},{num:v.num,title:v.title,note:v.note,sections}));},
+      onDelete:c?()=>remove("chapters",c.id):null});break;}
+    case "exportBackup":exportBackup();break;
+    case "artFilter":ui.artStatus=val;fillArticles();break;
+    case "addArticle":simpleEdit("articles",ART_FIELDS,"Add article",null,{status:"Identified",verified:false,design:"Not yet checked",fullText:"Not checked",rq:"Unclear"},["citation"]);break;
+    case "editArticle":simpleEdit("articles",ART_FIELDS,"Article",find("articles",id));break;
+    case "ideasView":ui.ideasView=val;render(true);break;
+    case "zoom":ui.zoom=Math.max(.6,Math.min(2.4,ui.zoom+(+val)*.35));{const b=$("#mapbox");if(b){b.innerHTML=mapSVG();centerMap();}}break;
+    case "hub":ideaForm(null,{theme:val});break;
+    case "addIdea":ideaForm(null);break;
+    case "addGap":ideaForm(null,{kind:"gap",theme:"gaps",gapType:GAP_TYPES.includes(val)?val:""});break;
+    case "editIdea":ideaForm(find("ideas",id));break;
+    case "logView":ui.logView=val;render(true);break;
+    case "addAdvisor":simpleEdit("advisor",ADV_FIELDS,"Add record",null,{type:val,status:"Open",date:new Date().toISOString().slice(0,10)},["text"]);break;
+    case "editAdvisor":simpleEdit("advisor",ADV_FIELDS,"Record",find("advisor",id));break;
+    case "addSearch":simpleEdit("searches",SEARCH_FIELDS,"Log a search",null,{status:"Run",date:new Date().toISOString().slice(0,10)},["string"]);break;
+    case "editSearch":simpleEdit("searches",SEARCH_FIELDS,"Search",find("searches",id));break;
+    case "addLink":simpleEdit("files",[{k:"name",label:"Title"},{k:"url",label:"URL",ph:"https://"},{k:"note",label:"Note",type:"textarea"}],"Add link",null,{kind:"link"},["url"]);break;
+    case "addNote":simpleEdit("files",[{k:"name",label:"Title"},{k:"note",label:"Note",type:"textarea",rows:6}],"Add note",null,{kind:"note"},["name"]);break;
+    case "editFile":{const f=find("files",id);if(!f)break;const fields=f.kind==="link"?[{k:"name",label:"Title"},{k:"url",label:"URL"},{k:"note",label:"Note",type:"textarea"}]:[{k:"name",label:"Title"},{k:"note",label:"Note",type:"textarea",rows:5}];
+      openForm({title:"Edit",fields,data:f,noFocus:true,onSave:v=>put("files",f.id,Object.assign(strip(f),v)),onDelete:async()=>{if(f.assetId&&assets){try{await assets.delete(f.assetId);}catch(er){}}return remove("files",f.id);}});break;}
+  }
+});
+document.addEventListener("keydown",e=>{if((e.key==="Enter"||e.key===" ")&&e.target.matches&&e.target.matches("g[data-act]")){e.preventDefault();e.target.dispatchEvent(new MouseEvent("click",{bubbles:true}));}});
+$("#fab").addEventListener("click",()=>ideaForm(null));
+
+/* ---------- boot ---------- */
+function setBanner(t){$("#banner").innerHTML=t?'<div class="banner">'+esc(t)+'</div>':"";}
+function setSync(ok,t){$("#syncDot").className="dot"+(ok?" ok":"");$("#syncText").textContent=t;}
+let pending=false;
+function mark(){if(!loaded){loaded=true;clearTimeout(loadTimer);setBanner("");setSync(true,window.OFFLINE?"On this phone":(canWrite?"Saved live":"View only"));}if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;render();});}
+function onErr(e){if(e&&e.code==="revoked"){setSync(false,"Disconnected");setBanner("This view lost access to the saved data.");}}
+async function boot(){
+  if(window.OFFLINE)window.offlineData.persist();
+  render(true);
+  if(!window.claude||typeof window.claude.use!=="function"){setSync(false,"Offline");setBanner("Open this page in Claude to load and save your dashboard.");return;}
+  loadTimer=setTimeout(()=>{if(!loaded){setBanner("Still connecting. Your data will appear as soon as the connection is ready.");}},10000);
+  db=await window.claude.use("db");
+  if(!db){clearTimeout(loadTimer);setSync(false,"Not loaded");setBanner("Your saved data could not load here. Open the page in the Claude app or on claude.ai while signed in.");return;}
+  window.claude.use("user").then(async u=>{if(!u)return;try{const c=await u.can("data.write");if(c===false){canWrite=false;setSync(loaded,"View only");$("#fab").hidden=true;}}catch(_){}});
+  window.claude.use("assets").then(a=>{assets=a;if(current()==="files")render(true);});
+  db.doc("meta/overview").onSnapshot(s=>{S.meta=s.exists?{...s.data()}:{};mark();},onErr);
+  COLS.forEach(c=>db.collection(c).onSnapshot(snap=>{S[c]=snap.docs.map(d=>Object.assign({id:d.id},d.data()));mark();},onErr));
+}
+boot();
+})();
+</script>
+
+</body></html>
