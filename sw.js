@@ -1,5 +1,5 @@
 /* Offline cache for the Knowing to Doing app. Bump VERSION when the app files change. */
-const VERSION = "ktd-v2";
+const VERSION = "ktd-v3";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png", "./icon-maskable-512.png", "./apple-touch-icon.png"];
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));

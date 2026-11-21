@@ -392,7 +392,7 @@ function viewHome(v){
   const msDone=ms.filter(x=>x.done).length;
   const openQ=S.advisor.filter(x=>x.type==="Question to clarify"&&x.status!=="Resolved");
   let h='<div class="stack">';
-  if(window.OFFLINE&&!S.rqs.length&&!S.articles.length&&!S.chapters.length)h+='<div class="banner">Nothing is saved in this app yet. Tap the button below and type your passcode to load your chapters, studies and notes.<div style="margin-top:10px"><button class="btn primary" data-act="loadCloud">Load my dissertation</button></div></div>';
+  if(window.OFFLINE&&!S.rqs.length&&!S.articles.length&&!S.chapters.length)h+='<div class="banner">Nothing is saved in this app yet. Tap the button below to load your chapters, studies and notes.<div style="margin-top:10px"><button class="btn primary" data-act="loadCloud">Load my dissertation</button></div></div>';
   h+='<div class="hero"><section class="panel title-card"><div class="panel-h" style="margin-bottom:0"><span class="eyebrow">Working title</span><button class="btn ghost" data-act="editMeta">Edit</button></div>';
   h+='<h1>'+(m.title?esc(m.title):'<span class="muted">Add your working title</span>')+'</h1>';
   if(m.purpose)h+='<p class="muted" style="margin:0">'+esc(m.purpose)+'</p>';
@@ -613,21 +613,12 @@ async function onImport(e){
   try{const obj=JSON.parse(await file.text());const n=await window.offlineData.importObject(obj,mode);toast("Imported "+n+" entries");if(msg)msg.textContent="Imported "+n+" entries from "+file.name+".";}
   catch(err){toast("Could not import that file");if(msg)msg.textContent=(err&&err.message)||"That file could not be read.";}
 }
-function loadCloud(){
-  openForm({title:"Load my dissertation",intro:"Type the passcode Claude gave you. Dashes and capital letters do not matter. This adds and updates your studies, chapters and notes without deleting anything you added yourself.",saveLabel:"Load",
-    fields:[{k:"code",label:"Passcode",ph:"xxxx-xxxx-xxxx"}],required:["code"],
-    onSave:async v=>{
-      try{
-        const r=await fetch("data.enc.json",{cache:"no-store"});if(!r.ok)throw new Error("net");
-        const e=await r.json();const code=v.code.toLowerCase().replace(/[^a-z0-9]/g,"");
-        const b=x=>Uint8Array.from(atob(x),c=>c.charCodeAt(0));
-        const base=await crypto.subtle.importKey("raw",new TextEncoder().encode(code),"PBKDF2",false,["deriveKey"]);
-        const key=await crypto.subtle.deriveKey({name:"PBKDF2",salt:b(e.salt),iterations:e.iter,hash:"SHA-256"},base,{name:"AES-GCM",length:256},false,["decrypt"]);
-        let pt;try{pt=await crypto.subtle.decrypt({name:"AES-GCM",iv:b(e.iv)},key,b(e.ct));}catch(_){toast("That passcode did not work. Check it and try again.");return false;}
-        const n=await window.offlineData.importObject(JSON.parse(new TextDecoder().decode(pt)),"merge");
-        toast("Loaded "+n+" entries");location.hash="home";return true;
-      }catch(err){toast("Could not reach the internet. Connect and try again.");return false;}
-    }});
+async function loadCloud(quiet){
+  try{
+    const r=await fetch("data.json",{cache:"no-store"});if(!r.ok)throw new Error("net");
+    const n=await window.offlineData.importObject(await r.json(),"merge");
+    toast("Loaded "+n+" entries");if(!quiet)location.hash="home";return true;
+  }catch(err){if(!quiet)toast("Could not reach the internet. Connect and try again.");return false;}
 }
 async function exportBackup(){
   const data=JSON.stringify(window.offlineData.exportObject());
@@ -664,7 +655,7 @@ document.addEventListener("click",async e=>{
       onSave:v=>{const old=Object.fromEntries((c&&c.sections||[]).map(s=>[s.t,s.s]));const sections=v.secs.split("\n").map(x=>x.trim()).filter(Boolean).map(x=>({t:x,s:old[x]||"Not started"}));return put("chapters",c&&c.id,Object.assign({},c?strip(c):{order:nextOrder("chapters"),createdAt:Date.now()},{num:v.num,title:v.title,note:v.note,sections}));},
       onDelete:c?()=>remove("chapters",c.id):null});break;}
     case "exportBackup":exportBackup();break;
-    case "loadCloud":loadCloud();break;
+    case "loadCloud":loadCloud(false);break;
     case "artFilter":ui.artStatus=val;fillArticles();break;
     case "addArticle":simpleEdit("articles",ART_FIELDS,"Add article",null,{status:"Identified",verified:false,design:"Not yet checked",fullText:"Not checked",rq:"Unclear"},["citation"]);break;
     case "editArticle":simpleEdit("articles",ART_FIELDS,"Article",find("articles",id));break;
@@ -695,7 +686,7 @@ let pending=false;
 function mark(){if(!loaded){loaded=true;clearTimeout(loadTimer);setBanner("");setSync(true,window.OFFLINE?"On this phone":(canWrite?"Saved live":"View only"));}if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;render();});}
 function onErr(e){if(e&&e.code==="revoked"){setSync(false,"Disconnected");setBanner("This view lost access to the saved data.");}}
 async function boot(){
-  if(window.OFFLINE)window.offlineData.persist();
+  if(window.OFFLINE){window.offlineData.persist();window.offlineData.counts().then(c=>{if(!Object.values(c).some(n=>n>0))loadCloud(true);});}
   render(true);
   if(!window.claude||typeof window.claude.use!=="function"){setSync(false,"Offline");setBanner("Open this page in Claude to load and save your dashboard.");return;}
   loadTimer=setTimeout(()=>{if(!loaded){setBanner("Still connecting. Your data will appear as soon as the connection is ready.");}},10000);
