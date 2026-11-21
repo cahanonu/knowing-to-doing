@@ -565,7 +565,7 @@ function viewLog(v){
   if(ui.logView==="advisor"){
     const open=S.advisor.filter(a=>a.type==="Question to clarify"&&a.status!=="Resolved");
     const rest=S.advisor.filter(a=>!open.includes(a)).sort((a,b)=>String(b.date||"").localeCompare(String(a.date||""))||newest(a,b));
-    h+='<div class="stack"><section class="panel"><div class="panel-h"><h3>Open questions for Dr. Rae</h3><button class="btn ghost" data-act="addAdvisor" data-v="Question to clarify">Add</button></div>'+(open.length?'<div class="list">'+open.sort(byOrder).map(advRow).join("")+'</div>':'<div class="empty">No open questions.</div>')+'</section>';
+    h+='<div class="stack"><section class="panel"><div class="panel-h"><h3>Open questions for your advisor</h3><button class="btn ghost" data-act="addAdvisor" data-v="Question to clarify">Add</button></div>'+(open.length?'<div class="list">'+open.sort(byOrder).map(advRow).join("")+'</div>':'<div class="empty">No open questions.</div>')+'</section>';
     h+='<section class="panel"><div class="panel-h"><h3>Meetings, recommendations and decisions</h3><button class="btn ghost" data-act="addAdvisor" data-v="Meeting">Add</button></div>'+(rest.length?'<div class="list">'+rest.map(advRow).join("")+'</div>':'<div class="empty">Nothing recorded yet.</div>')+'</section></div>';
   } else {
     const list=S.searches.slice().sort((a,b)=>String(b.date||"").localeCompare(String(a.date||""))||byOrder(a,b));
